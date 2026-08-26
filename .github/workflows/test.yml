@@ -110,23 +110,36 @@ jobs:
         with:
           name: prebuilt-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           path: native/prebuilt/vibrancy-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}.node
+      # A cache key cannot read the runner's ambient environment: the `env`
+      # context only exposes variables the workflow itself declares, so
+      # ${{ env.ImageOS }} rendered empty and run 32966466246 keyed on
+      # "apt-desktop---<hash>" — no Ubuntu release in it at all. Surface the
+      # values as step outputs, which can see the environment.
+      - name: Identify runner image (Linux)
+        id: runner-image
+        if: runner.os == 'Linux'
+        run: |
+          . /etc/os-release
+          echo "release=${VERSION_CODENAME:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "Ubuntu ${VERSION_ID:-?} (${VERSION_CODENAME:-?}), image ${ImageOS:-?}/${ImageVersion:-?}"
       # GitHub's Actions cache is free and, unlike the Ubuntu mirrors, reliably
-      # fast — so keep the ~30 MB of .debs in it rather than asking Azure for
+      # fast — so keep the ~24 MB of .debs in it rather than asking Azure for
       # them on every run. Only the archives are cached, never apt's package
       # lists: a stale .deb is simply ignored and re-fetched, whereas stale
       # lists make apt resolve versions that no longer exist in the pool and
-      # 404. ImageVersion is in the key so a runner-image bump refreshes the
-      # cache, with restore-keys falling back to the previous image's archives
-      # so a bump costs a partial download rather than the whole set.
+      # 404. The image version is in the key so a runner-image bump refreshes
+      # the cache; restore-keys then fall back to the same release's older
+      # archives, so a bump costs a partial download rather than the whole set.
       - name: Cache apt archives (Linux)
         if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
           path: ~/apt-archives
-          key: apt-desktop-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ hashFiles('.github/linux-desktop-packages.txt') }}
+          key: apt-desktop-${{ steps.runner-image.outputs.release }}-${{ steps.runner-image.outputs.image }}-${{ hashFiles('.github/linux-desktop-packages.txt') }}
           restore-keys: |
-            apt-desktop-${{ env.ImageOS }}-${{ env.ImageVersion }}-
-            apt-desktop-${{ env.ImageOS }}-
+            apt-desktop-${{ steps.runner-image.outputs.release }}-${{ steps.runner-image.outputs.image }}-
+            apt-desktop-${{ steps.runner-image.outputs.release }}-
       # imagemagick: screenshots (`import`). picom: the compositor — without it
       # X11 shows nothing through a transparent window, so this is the one piece
       # the transparency check cannot do without. openbox: honours
