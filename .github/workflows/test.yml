@@ -57,10 +57,10 @@ jobs:
   e2e-tests:
     runs-on: ${{ matrix.os }}
     # Baseline worst case is windows-latest at ~7m. The cap clears the longest
-    # per-OS chain of step caps below (Windows: 10+10+20+25 = 65m is the extreme
+    # per-OS chain of step caps below (Linux: 10+10+30+20 = 70m is the extreme
     # where every step exhausts its own budget) closely enough to stay a real
     # backstop while letting those step caps fire first. See `tests` above.
-    timeout-minutes: 70
+    timeout-minutes: 75
     env:
       # Scheduled runs test against Insiders to catch breaking changes early.
       # Manual dispatch uses the chosen version. Push/PR runs use stable.
@@ -72,8 +72,8 @@ jobs:
         # replace entries with your self-hosted labels, e.g.:
         #   os: [self-hosted-linux, self-hosted-macos, self-hosted-windows]
         # Self-hosted runners need: Node.js 20+, git, and a desktop session.
-        # On Linux self-hosted: also install imagemagick, openbox, picom,
-        # hsetroot, x11-xserver-utils (see "Install desktop tools" below).
+        # On Linux self-hosted: also install imagemagick, matchbox-window-manager,
+        # picom, xwallpaper, x11-xserver-utils (see "Install desktop tools" below).
         # Note: the E2E test changes the desktop wallpaper to solid green
         # while running (restored afterwards on macOS/Windows).
         # windows-11-arm is build-only — it compiles the arm64 native module
@@ -110,10 +110,20 @@ jobs:
         with:
           name: prebuilt-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           path: native/prebuilt/vibrancy-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}.node
-      # imagemagick: screenshots. openbox/picom/hsetroot/x11-xserver-utils:
-      # window manager, compositor, and green root wallpaper — required for the
-      # true-transparency check (X11 shows nothing through a transparent window
-      # without a compositing manager; run-e2e.js starts them itself).
+      # imagemagick: screenshots (`import`). picom: the compositor — without it
+      # X11 shows nothing through a transparent window, so this is the one piece
+      # the transparency check cannot do without. matchbox-window-manager: only
+      # to honour window.newWindowDimensions=maximized. xwallpaper: the green
+      # root backdrop. x11-xserver-utils: xsetroot, an uncomposited last resort.
+      # run-e2e.js starts the WM and compositor itself.
+      #
+      # openbox, hsetroot and scrot were dropped for weight, not taste: each
+      # reaches libimlib2 -> libspectre1 -> libgs10, which is how ~16 MB of
+      # Ghostscript and Type1 fonts (fonts-urw-base35 alone is 10.5 MB) ended up
+      # on a runner that only needed to screenshot a green rectangle. Swapping
+      # the WM and wallpaper tool takes the payload from 108 MB / 177 packages
+      # to 84 MB / 138, and drops exactly the files run 32948055478 died on.
+      # scrot was only a capture fallback; imagemagick's `import` is primary.
       #
       # Every apt call is wrapped in `timeout(1)` because this exact step once
       # wedged for six straight hours (run 32232380930): azure.archive.ubuntu.com
@@ -133,15 +143,44 @@ jobs:
       # So a mirror outage fails the job loudly rather than skipping ahead.
       - name: Install desktop tools (Linux)
         if: runner.os == 'Linux'
-        # Worst case with all retries and backoff exhausted is ~15m; the cap is
-        # a backstop for the unlikely case that `timeout` itself is outlived.
-        timeout-minutes: 16
+        # Worst case with all retries, mirror switches and backoff is ~28m.
+        timeout-minutes: 30
         shell: bash
         run: |
           set -euo pipefail
 
           # Retries/timeouts for the fetches apt does manage to bound itself.
           apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+
+          # The runner's sources point at a mirrorlist that prefers
+          # azure.archive.ubuntu.com and keeps archive.ubuntu.com only as a
+          # lower-priority entry. apt falls back on outright *failure*, never on
+          # slowness — so when Azure serves at 70 kB/s (see run 32948055478,
+          # where metadata came down at 7 MB/s from the same host while the
+          # package pool crawled) apt just keeps crawling. Deleting the Azure
+          # line forces the canonical archive for the retry.
+          MIRRORLIST=/etc/apt/apt-mirrors.txt
+          mirror_switched=0
+          force_canonical_mirror() {
+            [[ $mirror_switched -eq 1 ]] && return 1
+            [[ -f $MIRRORLIST ]] || return 1
+            grep -q 'azure\.archive\.ubuntu\.com' "$MIRRORLIST" || return 1
+            echo "Dropping the Azure mirror and retrying against archive.ubuntu.com. Mirrorlist was:"
+            sed 's/^/      /' "$MIRRORLIST"
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$MIRRORLIST" || true
+            # Only claim the switch once the line is verifiably gone. Marking it
+            # done on a failed rewrite would burn the remaining attempts on the
+            # same slow mirror while reporting that we had moved off it.
+            if grep -q 'azure\.archive\.ubuntu\.com' "$MIRRORLIST"; then
+              echo "::warning::Could not rewrite $MIRRORLIST; still pinned to the Azure mirror."
+              return 1
+            fi
+            mirror_switched=1
+            # apt keys its package lists by resolved URL, so the new mirror has
+            # no metadata yet and `install` could not resolve names without this.
+            sudo timeout --kill-after=30s 150s apt-get update "${apt_opts[@]}" || true
+            return 0
+          }
 
           # run_apt <description> <attempts> <per-attempt-limit> <command...>
           run_apt() {
@@ -158,8 +197,12 @@ jobs:
                 return 0
               fi
               # 124 = SIGTERM'd at the limit, 137 = needed the SIGKILL follow-up.
+              # Deliberately does NOT claim "stalled": the budget is just as
+              # easily blown by a mirror that streams steadily but far too
+              # slowly, which is what actually happened in run 32948055478. The
+              # apt output in the group above shows which one it was.
               if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-                echo "$desc hit its $limit wall-clock limit (attempt $attempt/$attempts) — the mirror is stalled, not merely slow."
+                echo "$desc exceeded its $limit budget (attempt $attempt/$attempts) — mirror stalled or too slow; see the Get: lines above."
               else
                 echo "$desc exited $rc (attempt $attempt/$attempts)."
               fi
@@ -167,6 +210,9 @@ jobs:
                 # A killed apt can leave the dpkg lock held or a package
                 # half-configured; clear that so the retry isn't doomed too.
                 sudo timeout 60s dpkg --configure -a || true
+                # Swap mirrors before sleeping: retrying the same slow mirror
+                # with the same budget would just fail the same way.
+                force_canonical_mirror || true
                 sleep $(( attempt * 15 ))
               fi
             done
@@ -174,9 +220,13 @@ jobs:
             return 1
           }
 
-          run_apt 'apt-get update' 3 120s apt-get update "${apt_opts[@]}"
-          run_apt 'apt-get install' 2 240s apt-get install -y "${apt_opts[@]}" \
-            imagemagick openbox picom hsetroot x11-xserver-utils
+          run_apt 'apt-get update' 3 150s apt-get update "${apt_opts[@]}"
+          # At the 70 kB/s seen in run 32948055478, the old 240s budget could
+          # not have finished the download it was given, so the budget is sized
+          # for a slow-but-working mirror rather than an ideal one.
+          run_apt 'apt-get install' 3 360s apt-get install -y --no-install-recommends \
+            "${apt_opts[@]}" \
+            imagemagick matchbox-window-manager picom xwallpaper x11-xserver-utils
       - name: Run E2E tests (Linux)
         if: runner.os == 'Linux'
         # Baseline ~3m.

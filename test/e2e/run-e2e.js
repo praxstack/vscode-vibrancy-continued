@@ -29,7 +29,8 @@
  *
  * Usage:   node test/e2e/run-e2e.js
  * Linux:   xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node test/e2e/run-e2e.js
- *          (requires openbox, picom, hsetroot for the transparency check)
+ *          (requires matchbox-window-manager, picom, xwallpaper for the
+ *          transparency check)
  */
 
 const path = require('path');
@@ -590,7 +591,12 @@ function setupDesktop() {
   const cleanup = [];
 
   if (process.platform === 'linux') {
-    for (const [cmd, args] of [['openbox', []], ['picom', ['--backend', 'xrender']]]) {
+    // matchbox-window-manager rather than openbox: the WM is only here to
+    // honour the maximize hint (picom is what makes transparency visible), and
+    // openbox reaches it through libimlib2 -> libspectre1 -> libgs10, dragging
+    // ~16 MB of Ghostscript and Type1 fonts onto the runner for nothing.
+    // matchbox does the same job clean, and fills the screen by design.
+    for (const [cmd, args] of [['matchbox-window-manager', []], ['picom', ['--backend', 'xrender']]]) {
       try {
         const proc = spawn(cmd, args, { stdio: 'ignore' });
         proc.on('error', (err) => console.log(`  ${cmd} failed to start: ${err.message}`));
@@ -600,20 +606,38 @@ function setupDesktop() {
         console.log(`  ${cmd} unavailable: ${err.message}`);
       }
     }
-    // hsetroot sets the root pixmap atoms compositors read for the wallpaper;
-    // xsetroot only recolors the root window (fine without a compositor).
-    try {
-      execSync('hsetroot -solid "#00FF00"', { timeout: 10000 });
-      console.log('  Wallpaper set via hsetroot');
-    } catch {
+    // A compositor takes its backdrop from the root-pixmap atoms
+    // (_XROOTPMAP_ID / ESETROOT_PMAP_ID). xwallpaper and hsetroot both set
+    // them; xsetroot does not -- it only recolors the root window, which picom
+    // ignores -- so xsetroot is a last resort that works only uncomposited.
+    // xwallpaper is preferred purely on weight: 0.65 MB against hsetroot's
+    // 43.6 MB, since hsetroot pulls the same imlib2/Ghostscript chain openbox
+    // did. It wants an image rather than a color, and solidPng already exists
+    // for the macOS path below.
+    const greenPng = path.join(os.tmpdir(), 'vibrancy-e2e-green.png');
+    fs.writeFileSync(greenPng, solidPng(0, 255, 0));
+    const rootSetters = [
+      [`xwallpaper --no-randr --zoom "${greenPng}"`, 'xwallpaper'],
+      ['hsetroot -solid "#00FF00"', 'hsetroot'],
+      ['xsetroot -solid "#00FF00"', 'xsetroot (no root pixmap; needs no compositor)'],
+    ];
+    let rootSet = null;
+    for (const [cmd, label] of rootSetters) {
       try {
-        execSync('xsetroot -solid "#00FF00"', { timeout: 10000 });
-        console.log('  Wallpaper set via xsetroot (hsetroot unavailable)');
-      } catch (err) {
-        console.log(`  Failed to set root color: ${err.message.split('\n')[0]}`);
-      }
+        execSync(cmd, { timeout: 10000, stdio: 'pipe' });
+        rootSet = label;
+        break;
+      } catch { /* try the next setter */ }
     }
-    // Give openbox/picom a moment to map before anything is captured.
+    if (rootSet) {
+      console.log(`  Wallpaper set via ${rootSet}`);
+    } else {
+      // Not fatal here, but the transparency assertion downstream cannot mean
+      // anything without a green backdrop, so say so loudly rather than
+      // letting it read as a pass.
+      console.log('  WARNING: no root-window setter worked; the green backdrop is missing');
+    }
+    // Give the WM/compositor a moment to map before anything is captured.
     sleepSync(2000);
   } else if (process.platform === 'darwin') {
     const pngPath = path.join(os.tmpdir(), 'vibrancy-e2e-green.png');
