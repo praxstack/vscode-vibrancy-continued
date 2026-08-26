@@ -29,8 +29,7 @@
  *
  * Usage:   node test/e2e/run-e2e.js
  * Linux:   xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node test/e2e/run-e2e.js
- *          (requires matchbox-window-manager, picom, xwallpaper for the
- *          transparency check)
+ *          (requires openbox, picom, xwallpaper for the transparency check)
  */
 
 const path = require('path');
@@ -591,12 +590,15 @@ function setupDesktop() {
   const cleanup = [];
 
   if (process.platform === 'linux') {
-    // matchbox-window-manager rather than openbox: the WM is only here to
-    // honour the maximize hint (picom is what makes transparency visible), and
-    // openbox reaches it through libimlib2 -> libspectre1 -> libgs10, dragging
-    // ~16 MB of Ghostscript and Type1 fonts onto the runner for nothing.
-    // matchbox does the same job clean, and fills the screen by design.
-    for (const [cmd, args] of [['matchbox-window-manager', []], ['picom', ['--backend', 'xrender']]]) {
+    // Keep openbox here even though it is the heaviest thing we install (it
+    // reaches libimlib2 -> libspectre1 -> libgs10, so ~16 MB of Ghostscript and
+    // Type1 fonts ride along). matchbox-window-manager was tried as a clean
+    // 5 MB replacement and regressed the whole point of the test: run
+    // 32956453916 kept a 100% green backdrop and a live CSS beacon but reported
+    // 0.0% green through both the editor and the sidebar. matchbox forces
+    // windows fullscreen rather than honouring maximize, and transparency stops
+    // being composited through them. Don't re-try it without a Linux e2e run.
+    for (const [cmd, args] of [['openbox', []], ['picom', ['--backend', 'xrender']]]) {
       try {
         const proc = spawn(cmd, args, { stdio: 'ignore' });
         proc.on('error', (err) => console.log(`  ${cmd} failed to start: ${err.message}`));
@@ -611,9 +613,9 @@ function setupDesktop() {
     // them; xsetroot does not -- it only recolors the root window, which picom
     // ignores -- so xsetroot is a last resort that works only uncomposited.
     // xwallpaper is preferred purely on weight: 0.65 MB against hsetroot's
-    // 43.6 MB, since hsetroot pulls the same imlib2/Ghostscript chain openbox
-    // did. It wants an image rather than a color, and solidPng already exists
-    // for the macOS path below.
+    // 43.6 MB. It wants an image rather than a color, and solidPng already
+    // exists for the macOS path below. Verified on CI: run 32956453916 reported
+    // a 100.0% green baseline through xwallpaper + picom.
     const greenPng = path.join(os.tmpdir(), 'vibrancy-e2e-green.png');
     fs.writeFileSync(greenPng, solidPng(0, 255, 0));
     const rootSetters = [

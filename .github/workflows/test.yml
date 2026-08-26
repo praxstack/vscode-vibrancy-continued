@@ -72,8 +72,8 @@ jobs:
         # replace entries with your self-hosted labels, e.g.:
         #   os: [self-hosted-linux, self-hosted-macos, self-hosted-windows]
         # Self-hosted runners need: Node.js 20+, git, and a desktop session.
-        # On Linux self-hosted: also install imagemagick, matchbox-window-manager,
-        # picom, xwallpaper, x11-xserver-utils (see "Install desktop tools" below).
+        # On Linux self-hosted: also install imagemagick, openbox, picom,
+        # xwallpaper, x11-xserver-utils (see "Install desktop tools" below).
         # Note: the E2E test changes the desktop wallpaper to solid green
         # while running (restored afterwards on macOS/Windows).
         # windows-11-arm is build-only — it compiles the arm64 native module
@@ -112,18 +112,23 @@ jobs:
           path: native/prebuilt/vibrancy-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}.node
       # imagemagick: screenshots (`import`). picom: the compositor — without it
       # X11 shows nothing through a transparent window, so this is the one piece
-      # the transparency check cannot do without. matchbox-window-manager: only
-      # to honour window.newWindowDimensions=maximized. xwallpaper: the green
-      # root backdrop. x11-xserver-utils: xsetroot, an uncomposited last resort.
+      # the transparency check cannot do without. openbox: honours
+      # window.newWindowDimensions=maximized. xwallpaper: the green root
+      # backdrop. x11-xserver-utils: xsetroot, an uncomposited last resort.
       # run-e2e.js starts the WM and compositor itself.
       #
-      # openbox, hsetroot and scrot were dropped for weight, not taste: each
-      # reaches libimlib2 -> libspectre1 -> libgs10, which is how ~16 MB of
-      # Ghostscript and Type1 fonts (fonts-urw-base35 alone is 10.5 MB) ended up
-      # on a runner that only needed to screenshot a green rectangle. Swapping
-      # the WM and wallpaper tool takes the payload from 108 MB / 177 packages
-      # to 84 MB / 138, and drops exactly the files run 32948055478 died on.
-      # scrot was only a capture fallback; imagemagick's `import` is primary.
+      # hsetroot and scrot are gone: both reach libimlib2 -> libspectre1 ->
+      # libgs10, hauling Ghostscript and Type1 fonts onto a runner whose job is
+      # to screenshot a green rectangle. xwallpaper sets the same root-pixmap
+      # atoms in 0.65 MB instead of 43.6, and scrot was only a capture fallback
+      # behind imagemagick's `import`.
+      #
+      # openbox reaches that same chain and is by far the heaviest item here, but
+      # it stays: matchbox-window-manager was tried as a clean 5 MB replacement
+      # and broke the test outright (run 32956453916 — 100% green backdrop, live
+      # CSS beacon, yet 0.0% green through editor and sidebar, because matchbox
+      # forces fullscreen instead of honouring maximize). The payload win isn't
+      # worth an assertion that no longer measures anything.
       #
       # Every apt call is wrapped in `timeout(1)` because this exact step once
       # wedged for six straight hours (run 32232380930): azure.archive.ubuntu.com
@@ -226,7 +231,7 @@ jobs:
           # for a slow-but-working mirror rather than an ideal one.
           run_apt 'apt-get install' 3 360s apt-get install -y --no-install-recommends \
             "${apt_opts[@]}" \
-            imagemagick matchbox-window-manager picom xwallpaper x11-xserver-utils
+            imagemagick openbox picom xwallpaper x11-xserver-utils
       - name: Run E2E tests (Linux)
         if: runner.os == 'Linux'
         # Baseline ~3m.
