@@ -1,0 +1,15 @@
+# Packages the Linux E2E desktop needs. One per line; blank lines and
+# "#" comments are ignored.
+#
+# This file is the single source of truth for the list AND the apt-archive
+# cache key: the "Cache apt archives" step in test.yml hashes it, so editing
+# this list invalidates the cache automatically and the two can never drift.
+#
+# Why each one is here (and what was deliberately left out) is documented
+# above the "Install desktop tools (Linux)" step in test.yml.
+
+imagemagick           # `import`, the primary screenshot path
+openbox               # honours window.newWindowDimensions=maximized
+picom                 # the compositor — without it nothing shows through
+xwallpaper            # green root backdrop, via the root-pixmap atoms
+x11-xserver-utils     # xsetroot, an uncomposited last resort

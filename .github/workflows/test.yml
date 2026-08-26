@@ -72,8 +72,8 @@ jobs:
         # replace entries with your self-hosted labels, e.g.:
         #   os: [self-hosted-linux, self-hosted-macos, self-hosted-windows]
         # Self-hosted runners need: Node.js 20+, git, and a desktop session.
-        # On Linux self-hosted: also install imagemagick, openbox, picom,
-        # xwallpaper, x11-xserver-utils (see "Install desktop tools" below).
+        # On Linux self-hosted: also install the packages listed in
+        # .github/linux-desktop-packages.txt (see "Install desktop tools" below).
         # Note: the E2E test changes the desktop wallpaper to solid green
         # while running (restored afterwards on macOS/Windows).
         # windows-11-arm is build-only — it compiles the arm64 native module
@@ -110,6 +110,23 @@ jobs:
         with:
           name: prebuilt-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           path: native/prebuilt/vibrancy-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}.node
+      # GitHub's Actions cache is free and, unlike the Ubuntu mirrors, reliably
+      # fast — so keep the ~30 MB of .debs in it rather than asking Azure for
+      # them on every run. Only the archives are cached, never apt's package
+      # lists: a stale .deb is simply ignored and re-fetched, whereas stale
+      # lists make apt resolve versions that no longer exist in the pool and
+      # 404. ImageVersion is in the key so a runner-image bump refreshes the
+      # cache, with restore-keys falling back to the previous image's archives
+      # so a bump costs a partial download rather than the whole set.
+      - name: Cache apt archives (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-desktop-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ hashFiles('.github/linux-desktop-packages.txt') }}
+          restore-keys: |
+            apt-desktop-${{ env.ImageOS }}-${{ env.ImageVersion }}-
+            apt-desktop-${{ env.ImageOS }}-
       # imagemagick: screenshots (`import`). picom: the compositor — without it
       # X11 shows nothing through a transparent window, so this is the one piece
       # the transparency check cannot do without. openbox: honours
@@ -154,8 +171,34 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Single source of truth for the package list; also what the cache key
+          # above hashes, so the list and the cache cannot drift apart.
+          mapfile -t pkgs < <(grep -vE '^[[:space:]]*(#|$)' .github/linux-desktop-packages.txt \
+                              | sed 's/[[:space:]]*#.*//')
+          if [[ ${#pkgs[@]} -eq 0 ]]; then
+            echo "::error::.github/linux-desktop-packages.txt yielded no packages."
+            exit 1
+          fi
+          echo "Packages: ${pkgs[*]}"
+
+          # apt needs a `partial/` subdir inside whatever it uses for archives.
+          APT_ARCHIVES="$HOME/apt-archives"
+          mkdir -p "$APT_ARCHIVES/partial"
+          restored=$(find "$APT_ARCHIVES" -maxdepth 1 -name '*.deb' | wc -l)
+          echo "Restored $restored .deb(s) from the Actions cache."
+
           # Retries/timeouts for the fetches apt does manage to bound itself.
-          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          # APT::Sandbox::User=root is deliberate. apt normally drops to the
+          # `_apt` user to download, but the cache has to live somewhere
+          # actions/cache can read — i.e. under $HOME — and `_apt` cannot
+          # traverse into it. apt then downloads as root anyway and merely warns,
+          # so this states the outcome instead of emitting a scary-looking
+          # "unsandboxed as root ... Permission denied" line on every run. The
+          # sandbox buys nothing here: everything else in this step is already
+          # root on a single-tenant throwaway runner.
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+                    -o Dir::Cache::archives="$APT_ARCHIVES"
+                    -o APT::Sandbox::User=root)
 
           # The runner's sources point at a mirrorlist that prefers
           # azure.archive.ubuntu.com and keeps archive.ubuntu.com only as a
@@ -225,13 +268,34 @@ jobs:
             return 1
           }
 
-          run_apt 'apt-get update' 3 150s apt-get update "${apt_opts[@]}"
-          # At the 70 kB/s seen in run 32948055478, the old 240s budget could
-          # not have finished the download it was given, so the budget is sized
-          # for a slow-but-working mirror rather than an ideal one.
-          run_apt 'apt-get install' 3 360s apt-get install -y --no-install-recommends \
-            "${apt_opts[@]}" \
-            imagemagick openbox picom xwallpaper x11-xserver-utils
+          # Fast path: if the restored cache already holds every .deb we need,
+          # --no-download installs from it and touches the network not at all,
+          # which is the entire point of the cache. It is also self-verifying:
+          # apt fails outright rather than quietly fetching if anything is
+          # missing, so this cannot silently degrade into the slow path.
+          echo "::group::install from cache (--no-download, no network)"
+          cache_hit=0
+          sudo timeout --kill-after=30s 180s apt-get install -y --no-download \
+            --no-install-recommends "${apt_opts[@]}" "${pkgs[@]}" && cache_hit=1
+          echo "::endgroup::"
+
+          if [[ $cache_hit -eq 1 ]]; then
+            echo "Installed entirely from the Actions cache — no mirror traffic."
+          else
+            echo "Cache incomplete (or the image's package lists are stale); fetching the remainder."
+            run_apt 'apt-get update' 3 150s apt-get update "${apt_opts[@]}"
+            # At the 70 kB/s seen in run 32948055478, the old 240s budget could
+            # not have finished the download it was given, so the budget is
+            # sized for a slow-but-working mirror rather than an ideal one.
+            run_apt 'apt-get install' 3 360s apt-get install -y --no-install-recommends \
+              "${apt_opts[@]}" "${pkgs[@]}"
+          fi
+
+          # actions/cache runs as the runner user, so hand the archives back to
+          # it or the post-job save finds an unreadable tree.
+          sudo chown -R "$(id -u):$(id -g)" "$APT_ARCHIVES"
+          echo "Cached now: $(find "$APT_ARCHIVES" -maxdepth 1 -name '*.deb' | wc -l) .deb(s)"
+
       - name: Run E2E tests (Linux)
         if: runner.os == 'Linux'
         # Baseline ~3m.
